@@ -46,6 +46,21 @@ This document outlines the system design for a scalable and resilient video AI g
 ## 4. System Design Diagram
 
 ```mermaid
+%%{
+  init: {
+    "theme": "base",
+    "themeVariables": {
+      "background": "#ffffff",
+      "primaryColor": "#e8f0fe",
+      "primaryTextColor": "#1d1d1f",
+      "primaryBorderColor": "#1a73e8",
+      "lineColor": "#5f6368",
+      "secondaryColor": "#f3e8fd",
+      "tertiaryColor": "#f5f5f7",
+      "edgeLabelBackground": "#ffffff"
+    }
+  }
+}%%
 flowchart TD
     %% Styling Classes with explicit dark text colors for high readability
     classDef client fill:#f5f5f7,stroke:#1d1d1f,stroke-width:2px,color:#1d1d1f;
