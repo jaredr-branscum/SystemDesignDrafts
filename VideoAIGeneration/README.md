@@ -28,20 +28,70 @@ This document outlines the system design for a scalable and resilient video AI g
   * Adjusting video quality resolution for customer device (abstracted as something spooky)
 
 ## 3. Components
-* Request Handler
-  * Enqueues requests for generating videos to the message queue
-* Job Processing Service
-  * Orchestrates spinning up jobs to produce videos and manages the job lifecycle
-  * Retains the job status
-* Video Generation Service
-  * The specialized hardware instances that run generative AI models to generate videos
-* Video Compiler Service
-  * Assembles video chunks from object storage into media files that can be downloaded
-  * Subscribed to Pub/Sub Topic
-* Video Playback Service
-  * Retrieves the viewable video files from Object Storage and other complex system components for supporting video that are out of scope
-* Notification Service
-  * Responsible for pushing notifications to third-party customer channels
+
+### Ingress
+* **API Gateway**
+  * Authenticates requests and enforces rate limits
+  * Routes job submission to the Ingestion layer and video view requests to the Playback layer
+
+### Ingestion & State Layer
+* **Request Ingestion Service**
+  * Validates and persists incoming job requests to the SQL Primary DB
+  * Enqueues a job task to the Job Ingestion Queue
+* **SQL Primary DB**
+  * Single source of truth for job metadata and workflow state across all pipeline stages
+* **Job Ingestion Queue**
+  * Decouples the HTTP request path from the orchestration layer
+* **Job Workflow Coordinator (Temporal State Machine)**
+  * Manages the full job lifecycle: Created → Generating → Compiling → Transcoding → Ready
+  * Dispatches tasks to downstream queues and handles retries on stage failure
+
+### GPU Execution Pool (Pull-Based)
+* **GPU Task Queue**
+  * Buffers pending generation tasks; workers pull when GPU capacity is available
+  * Enables SQS-style visibility timeout for automatic retry on worker crash
+* **GPU Generation Worker Pool**
+  * Autoscaled pool of GPU instances that pull tasks and run the generative AI model
+  * Streams output chunks to Object Storage and emits progress events to Redis
+* **Autoscaling Controller (KEDA)**
+  * Monitors GPU Task Queue depth and scales the worker pool up or down accordingly
+* **Model Warm Cache / Registry**
+  * Stores pre-loaded AI model weights to eliminate cold-start latency on new worker instances
+* **NoSQL DB (Worker Checkpoints)**
+  * Persists in-progress generation snapshots so interrupted jobs can resume from the last checkpoint
+* **Object Storage (Raw Chunks)**
+  * Stores raw video chunks produced by the generation workers
+
+### Compilation & Packaging Pipeline
+* **Compilation Queue**
+  * Buffers compile jobs; triggered by the Coordinator once all generation chunks are confirmed
+* **Video Compiler Service**
+  * Pulls chunk lists from Object Storage and merges them into a single contiguous video file
+* **Transcoding Queue**
+  * Buffers transcode jobs; triggered by the Coordinator once compilation succeeds
+* **Video Transcoding Service (FFmpeg / ABR Packaging)**
+  * Transcodes the compiled video into multi-bitrate HLS/DASH adaptive streaming segments
+  * Registers the output manifest URL in the SQL Primary DB on completion
+* **Object Storage (HLS/DASH Segments)**
+  * Stores the final adaptive bitrate video segments and manifests served to the CDN
+
+### Real-time Status Delivery
+* **Redis Cache (Live Status & Progress)**
+  * Holds per-job progress state written by GPU workers; fan-out source for the Notification Service
+* **Notification & Event Service**
+  * Consumes status events from Redis and fans out to the WebSocket gateway and third-party channels
+* **WebSocket / SSE Gateway**
+  * Maintains persistent connections with clients and pushes real-time job progress updates
+* **Third Party Services (SMS, E-mail, Webhooks)**
+  * External notification channels for job completion or failure alerts
+
+### Delivery & Playback
+* **Video Playback Service**
+  * Resolves the HLS manifest URL for a completed job and returns it to the client
+* **Redis Metadata Cache**
+  * Caches manifest URLs and job completion metadata to reduce SQL read load on playback requests
+* **CDN (Akamai/Cloudflare)**
+  * Caches and serves HLS/DASH segment files at the edge for low-latency global video streaming
 
 ## 4. System Design Diagram
 
@@ -71,7 +121,6 @@ flowchart TD
     classDef database fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#1d1d1f;
     classDef external fill:#f1f3f4,stroke:#5f6368,stroke-width:2px,color:#1d1d1f;
     classDef thirdparty fill:#f1f3f4,stroke:#5f6368,stroke-width:2px,stroke-dasharray: 5 5,color:#1d1d1f;
-    classDef cloud fill:#fce8e6,stroke:#ea4335,stroke-width:2px,color:#1d1d1f;
     classDef orchestrator fill:#e1f5fe,stroke:#0288d1,stroke-width:2px,color:#1d1d1f;
 
     %% Node Definitions
@@ -94,7 +143,7 @@ flowchart TD
         Autoscaler["Autoscaling Controller (KEDA)"]:::gateway
         ModelCache[("Model Warm Cache / Registry")]:::database
         NoSQL[("NoSQL DB<br/>(Worker Checkpoints)")]:::database
-        ObjStore[("Object Storage<br/>(Raw Chunks & Compiled Video)")]:::database
+        ObjStore[("Object Storage<br/>(Raw Chunks)")]:::database
     end
 
     subgraph Post_Processing_Layer["Compilation & Packaging Pipeline"]
@@ -102,6 +151,7 @@ flowchart TD
         Compiler["Video Compiler Service"]:::service
         TranscodeQueue["Transcoding Queue"]:::queue
         Transcoder["Video Transcoding Service<br/>(FFmpeg / ABR Packaging)"]:::service
+        ObjStoreOut[("Object Storage<br/>(HLS/DASH Segments)")]:::database
     end
 
     subgraph Notification_Layer["Real-time Status Delivery"]
@@ -149,14 +199,14 @@ flowchart TD
     Coordinator -->|11. Trigger Merge| CompileQueue
     CompileQueue -.->|Pull| Compiler
     ObjStore -->|12. Read Chunks| Compiler
-    Compiler -->|13. Upload Raw Video| ObjStore
-    Compiler -->|14. Success Event| Coordinator
+    Compiler -->|13. Upload Raw Video| ObjStoreOut
 
     %% Transcoding Flow
+    Compiler -->|14. Success Event| Coordinator
     Coordinator -->|15. Trigger Transcode| TranscodeQueue
     TranscodeQueue -.->|Pull| Transcoder
-    ObjStore -->|16. Read Raw Video| Transcoder
-    Transcoder -->|17. Upload HLS/DASH Segments| ObjStore
+    ObjStoreOut -->|16. Read Raw Video| Transcoder
+    Transcoder -->|17. Upload HLS/DASH Segments| ObjStoreOut
     Transcoder -->|18. Register Manifest| JobDb
     Transcoder -->|19. Complete Event| Coordinator
 
@@ -166,6 +216,5 @@ flowchart TD
     RedisPlayback <-->|Sync metadata| JobDb
     Playback -->|Return HLS Playback URL| Client
     Client -->|Stream Video Segments| CDN
-    CDN -->|Cache & Serve| ObjStore
+    CDN -->|Cache & Serve| ObjStoreOut
 ```
-
